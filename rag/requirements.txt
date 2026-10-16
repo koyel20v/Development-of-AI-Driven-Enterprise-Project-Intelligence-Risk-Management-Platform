@@ -1,0 +1,14 @@
+# Run from rag/:  pip install -r requirements.txt
+# Versions marked "tested" were exercised by the unit tests; ranges are constrained for compatibility.
+
+chromadb>=1.0,<2.0            # tested with 1.5.9 (uses PersistentClient + `configuration={"hnsw": {"space": "cosine"}}`)
+pypdf>=5.0,<7.0               # tested with 5.9.0
+python-docx>=1.1,<2.0         # tested with 1.2.0 (needs Document.iter_inner_content)
+sentence-transformers>=3.0,<6.0   # local embeddings; NOT exercised in the sandbox (model download blocked) - see README
+groq>=0.11                    # default answer generation (tested with 1.7.0); real API NOT exercised in the sandbox
+anthropic>=0.40.0             # optional: only if LLM_PROVIDER=anthropic
+python-dotenv>=1.0,<2.0       # loads rag/.env (optional but recommended)
+numpy>=1.26
+
+# tests
+pytest>=8.0

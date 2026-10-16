@@ -1,0 +1,24 @@
+PROJECT CHARTER (TEMPLATE)
+Project: AI-Driven Enterprise Project Intelligence & Risk Management Platform
+
+1. PURPOSE
+Give project managers and executives a single platform that predicts project risks early, explains why they are happening, and recommends actions, using both structured project data and unstructured project documents.
+
+2. OBJECTIVES
+- Predict schedule delay and cost overrun probability for every active project.
+- Maintain a live, scored risk register across the project portfolio.
+- Provide a natural-language assistant (RAG) that answers questions from project documents with source citations.
+- Reduce the time spent on manual status reporting by at least 40 percent.
+
+3. SCOPE
+In scope: data ingestion from project tools, risk scoring models, RAG assistant, dashboards, alerts.
+Out of scope: replacing the existing project scheduling tool, financial accounting.
+
+4. STAKEHOLDERS
+Sponsor: Chief Operations Officer. Users: Project Managers, PMO, Risk Officers, Executives.
+
+5. KEY DELIVERABLES
+Data pipeline, risk prediction models, RAG knowledge base, web dashboard, user documentation.
+
+6. SUCCESS CRITERIA
+Risk prediction recall above 80 percent on historical projects; RAG answers grounded in cited documents; adoption by at least 70 percent of active project managers.

@@ -1,0 +1,17 @@
+LESSONS LEARNED (SAMPLE)
+Project: Customer Portal (closed)
+
+WHAT WENT WELL
+Daily standups kept teams aligned. Early user prototypes reduced rework.
+
+WHAT WENT WRONG
+Security testing was left to the final month and revealed critical defects, delaying launch by 5 weeks. Requirements kept changing without impact analysis, causing budget overrun of 12 percent.
+
+ROOT CAUSES
+No security testing in the sprint cycle. No formal change control process.
+
+RECOMMENDATIONS
+1. Run security scans every sprint.
+2. Require impact analysis before accepting any scope change.
+3. Reserve 10 to 15 percent schedule buffer for integration and security fixes.
+4. Escalate any task more than 5 days late in the first week it slips.

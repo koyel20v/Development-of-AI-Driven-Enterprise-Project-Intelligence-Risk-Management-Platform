@@ -1,0 +1,12 @@
+DATA DICTIONARY (TEMPLATE)
+project_id: unique project identifier
+planned_start / planned_end: baseline dates
+actual_start / actual_end: real dates
+planned_cost / actual_cost: baseline and actual spend
+percent_complete: progress, 0-100
+schedule_variance_days: actual end (or forecast) minus planned end
+cost_variance_pct: (actual_cost - planned_cost) / planned_cost x 100
+risk_id, risk_category, likelihood, impact, risk_score
+change_request_count: number of scope change requests
+team_size, resource_utilization_pct
+risk_label: target for ML model (1 = delayed or overrun, 0 = on track)

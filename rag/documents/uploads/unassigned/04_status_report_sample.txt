@@ -1,0 +1,17 @@
+WEEKLY STATUS REPORT (SAMPLE)
+Project: ERP Migration    Week ending: 2026-09-25    Overall status: AMBER
+
+PROGRESS THIS WEEK
+Completed user acceptance testing for the finance module. Data mapping for the HR module is 70 percent complete.
+
+PLANNED NEXT WEEK
+Start HR module migration rehearsal. Finalize cutover plan.
+
+SCHEDULE: 6 working days behind baseline, caused by late vendor delivery (see R-001).
+BUDGET: 94 percent of planned spend used at 88 percent of planned progress. Forecast overrun: 4 percent.
+
+ISSUES
+Vendor module delivered with 12 open defects. Two business SMEs unavailable for 2 weeks.
+
+DECISIONS NEEDED
+Approve 2 additional contractors for 4 weeks to recover schedule.

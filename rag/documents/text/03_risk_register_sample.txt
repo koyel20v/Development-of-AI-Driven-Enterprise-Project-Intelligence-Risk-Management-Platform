@@ -1,0 +1,33 @@
+RISK REGISTER (SAMPLE ENTRIES)
+
+Risk ID: R-001
+Project: ERP Migration
+Category: Vendor
+Description: Vendor delays delivery of the data-migration module.
+Likelihood: 4  Impact: 4  Score: 16 (High)
+Mitigation: Weekly vendor checkpoints; contractual delay penalties; identify backup vendor.
+Owner: Program Manager  Status: Open
+
+Risk ID: R-002
+Project: Mobile Banking App
+Category: Scope Change
+Description: Frequent new feature requests from business stakeholders after requirements sign-off.
+Likelihood: 5  Impact: 3  Score: 15 (High)
+Mitigation: Formal change control board; freeze scope per sprint; impact analysis per request.
+Owner: Product Owner  Status: Mitigating
+
+Risk ID: R-003
+Project: Data Center Upgrade
+Category: Resource
+Description: Key network engineer may leave mid-project.
+Likelihood: 2  Impact: 5  Score: 10 (Medium)
+Mitigation: Cross-train second engineer; document configurations.
+Owner: Engineering Lead  Status: Open
+
+Risk ID: R-004
+Project: Customer Portal
+Category: Security
+Description: Penetration test may find critical vulnerabilities close to launch.
+Likelihood: 3  Impact: 5  Score: 15 (High)
+Mitigation: Run security testing early and per sprint; reserve two weeks of buffer.
+Owner: Security Lead  Status: Open

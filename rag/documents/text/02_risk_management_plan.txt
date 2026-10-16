@@ -1,0 +1,24 @@
+RISK MANAGEMENT PLAN (TEMPLATE)
+
+RISK CATEGORIES
+Schedule, Budget, Resource, Technical, Vendor/Third-party, Compliance/Legal, Scope Change, Security, Stakeholder.
+
+RISK IDENTIFICATION
+Risks are identified through weekly status reviews, retrospectives, automated signals from the platform (late tasks, burn-rate spikes, repeated change requests), and stakeholder reporting.
+
+RISK SCORING
+Score = Likelihood (1-5) x Impact (1-5).
+Likelihood: 1 Rare, 2 Unlikely, 3 Possible, 4 Likely, 5 Almost certain.
+Impact: 1 Negligible, 2 Minor, 3 Moderate, 4 Major, 5 Severe.
+Rating bands: 1-5 Low, 6-12 Medium, 13-19 High, 20-25 Critical.
+
+RESPONSE STRATEGIES
+Avoid, Mitigate, Transfer, Accept. Every High or Critical risk must have an owner, a mitigation plan, and a review date.
+
+ESCALATION RULES
+- Medium: reviewed by Project Manager weekly.
+- High: escalated to PMO within 2 business days.
+- Critical: escalated to Executive Sponsor within 24 hours.
+
+MONITORING
+Risk register reviewed weekly. Closed risks are recorded with outcome notes for lessons learned.

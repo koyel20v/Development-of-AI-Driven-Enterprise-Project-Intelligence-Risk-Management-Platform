@@ -1,0 +1,8 @@
+SAMPLE QUESTIONS FOR TESTING THE RAG ASSISTANT
+1. Which projects have high or critical risks right now?
+2. What caused the delay in the ERP Migration project?
+3. How is a risk score calculated?
+4. What escalation is required for a critical risk?
+5. What lessons were learned from the Customer Portal project?
+6. What does the field cost_variance_pct mean?
+7. What mitigation was planned for vendor delays?
