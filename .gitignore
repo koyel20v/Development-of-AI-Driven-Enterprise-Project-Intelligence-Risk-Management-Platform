@@ -254,3 +254,5 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+# Generated RAG vector database
+rag/chroma_db/
