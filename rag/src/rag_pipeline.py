@@ -18,20 +18,35 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
+from itertools import islice
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .config import RAGSettings
-from .document_loader import LoadStats, iter_documents
+from .document_loader import DEFAULT_MAX_FILE_MB, SUPPORTED_EXTENSIONS, LoadStats, _file_sha256, _iter_files
 from .embeddings import Embedder, EmbeddingError, create_embedder
+from .ingest_manifest import (
+    STATUS_EMPTY,
+    STATUS_OK,
+    IngestManifest,
+    ManifestEntry,
+    compute_signature,
+    manifest_path,
+)
+from .ingest_worker import PreparedFile, prepare_file
 from .llm import INSUFFICIENT_SENTINEL, AnswerGenerator, LLMError, create_generator, describe_location
-from .text_chunker import ChunkingConfig, chunk_document, estimate_tokens
+from .text_chunker import Chunk, ChunkingConfig, estimate_tokens
 from .vector_store import ChromaVectorStore, SearchResult, VectorStoreError, build_where
 
 logger = logging.getLogger(__name__)
 
 MAX_QUESTION_CHARS = 2000
+# Default number of chunks (from several documents) embedded together; override with RAG_EMBED_FLUSH_CHUNKS.
+EMBED_FLUSH_CHUNKS = 256
+# progress(stage, done, total, detail): stages are "plan", "file" and "embed" (see RAGPipeline.ingest)
+ProgressCallback = Callable[[str, int, int, str], None]
 NO_EVIDENCE_ANSWER = (
     f"{INSUFFICIENT_SENTINEL}: no relevant passages were found in the indexed project documents "
     "for this question (and filters)."
@@ -97,9 +112,30 @@ class IngestionReport:
     empty_files: List[str] = field(default_factory=list)
     total_chunks_in_store: int = 0
     duration_s: float = 0.0
+    # --- performance reporting (added; the fields above are unchanged) ---
+    mode: str = ""  # "initial indexing" | "incremental" | "full re-index (--force)"
+    files_discovered: int = 0  # supported files found on disk
+    documents_skipped_without_parsing: int = 0  # unchanged per manifest: not even opened for parsing
+    documents_empty_cached: int = 0  # known-empty files (e.g. scanned PDFs) not re-parsed
+    embed_calls: int = 0  # calls to Embedder.embed_documents
+    model_batches: int = 0  # model.encode batches actually executed (local model only)
+    manifest_note: str = ""
+    timings_s: Dict[str, float] = field(default_factory=dict)  # hash/load/chunk/embed/db; load+chunk are summed across workers
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class _Pending:
+    """A document waiting for its chunks to be embedded and written."""
+
+    path: str
+    sha: str
+    to_embed: List[Chunk]
+    new_ids: Set[str]
+    stale_ids: List[str]
+    total_chunks: int
 
 
 def _source_from_result(number: int, result: SearchResult, cited: bool = False) -> Source:
@@ -205,78 +241,344 @@ class RAGPipeline:
         return store
 
     # ------------------------------------------------------------------ ingestion
+    def _store_for_ingest(self) -> ChromaVectorStore:
+        """Open the store, loading the embedding model only if it is really needed.
+
+        Importing torch and loading the model takes seconds and used to happen on EVERY run, even when
+        nothing needed embedding. If the collection already records its embedding model and dimension,
+        the store can be opened from that metadata and the model is loaded lazily on first use.
+        """
+        if self._embedder is not None or self._store is not None:
+            return self._ready_store()
+        meta = ChromaVectorStore.peek_metadata(self.settings.chroma_dir, self.settings.collection_name)
+        if meta and meta.get("embedding_dim"):
+            # The constructor verifies the stored model name against the configured one.
+            self._store = ChromaVectorStore(
+                persist_dir=self.settings.chroma_dir,
+                collection_name=self.settings.collection_name,
+                embedding_model=self.settings.embedding_model,
+                embedding_dim=int(meta["embedding_dim"]),
+            )
+            return self._store
+        return self._ready_store()  # new collection: the embedder's model/dimension are needed to create it
+
+    def _open_manifest(self, force: bool) -> IngestManifest:
+        model_name = self._embedder.model_name if self._embedder is not None else self.settings.embedding_model
+        path = manifest_path(self.settings.chroma_dir, self.settings.collection_name)
+        signature = compute_signature(self.settings, model_name)
+        if self.settings.use_manifest and not force:
+            return IngestManifest.load(path, signature)
+        manifest = IngestManifest(path, signature)
+        manifest.note = "not used (--force)" if force else "disabled (RAG_USE_MANIFEST=false)"
+        return manifest
+
+    def reset_index(self) -> None:
+        """Drop the collection (never the directory) and forget the ingestion manifest."""
+        self._ready_store().reset()
+        IngestManifest(
+            manifest_path(self.settings.chroma_dir, self.settings.collection_name), signature=""
+        ).delete_file()
+
+    def _iter_prepared(
+        self, work: List[Tuple[Path, str, str]], root: Path, config: ChunkingConfig
+    ) -> Iterator[Tuple[str, str, PreparedFile]]:
+        """Parse + chunk files, in order. Uses a bounded process pool when ``load_workers > 1``."""
+        level, max_mb = self.settings.project_folder_level, DEFAULT_MAX_FILE_MB
+
+        def run(path: Path, relative: str) -> PreparedFile:
+            return prepare_file(str(path), str(root), relative, level, max_mb, config)
+
+        workers = min(self.settings.load_workers, len(work))
+        done: Set[str] = set()
+        if workers > 1:
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    iterator = iter(work)
+                    window: deque = deque()  # bounded look-ahead keeps memory use flat
+
+                    def submit(item: Tuple[Path, str, str]) -> None:
+                        path, relative, sha = item
+                        window.append((relative, sha, pool.submit(prepare_file, str(path), str(root), relative, level, max_mb, config)))
+
+                    for item in islice(iterator, workers * 2):
+                        submit(item)
+                    while window:
+                        relative, sha, future = window.popleft()
+                        prepared = future.result()
+                        done.add(relative)
+                        yield relative, sha, prepared
+                        following = next(iterator, None)
+                        if following is not None:
+                            submit(following)
+            except Exception as exc:  # pool could not start / worker died: finish the rest in-process
+                logger.warning("Parallel loading failed (%s: %s); continuing in a single process", type(exc).__name__, exc)
+        for path, relative, sha in work:
+            if relative not in done:
+                yield relative, sha, run(path, relative)
+
     def ingest(
         self,
         documents_dir: Optional[Path | str] = None,
         force: bool = False,
         prune: bool = False,
+        progress: Optional[ProgressCallback] = None,
+        only_paths: Optional[Sequence[str]] = None,
     ) -> IngestionReport:
         """Load, chunk, embed and index all documents. Safe to run repeatedly.
 
-        * Unchanged files (identical chunk ids already stored) are skipped without embedding.
-        * Changed files: only new chunks are embedded; chunks of the old version are deleted.
-        * ``force=True`` re-embeds everything. ``prune=True`` also removes indexed sources whose
-          files no longer exist. The persistence directory itself is never deleted.
+        Workflow
+        --------
+        1. One bulk read of the ChromaDB metadata (``source_path -> chunk ids``).
+        2. Every file is hashed (SHA-256). A file whose hash matches the manifest AND whose chunk count
+           in ChromaDB matches is skipped without being parsed.
+        3. Only new/changed files are parsed and chunked (optionally in ``RAG_LOAD_WORKERS`` processes).
+           Chunk ids are deterministic, so chunks already stored are never re-embedded.
+        4. New chunks of many documents are embedded in one batch call, written to ChromaDB in one upsert,
+           and stale chunks of changed files are deleted by id. The manifest is saved after each batch,
+           so an interrupted run resumes where it stopped.
+
+        ``only_paths`` (relative POSIX paths below the documents directory) restricts the run to exactly those
+        files: nothing else in the folder is hashed, parsed or embedded, and ``prune`` is ignored. The upload UI
+        must always pass it so historical files are never indexed as a side effect of an upload.
+
+        ``force=True`` re-embeds everything and ignores the manifest. ``prune=True`` also removes indexed
+        sources whose files no longer exist. The persistence directory itself is never deleted.
+        ``progress(stage, done, total, detail)`` is optional: stage ``"plan"`` (total = files to process),
+        ``"file"`` (done of total files processed) and ``"embed"`` (done = chunks embedded so far).
         """
         started = time.perf_counter()
         report = IngestionReport()
         root = Path(documents_dir) if documents_dir else self.settings.documents_dir
+        root = Path(root).resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Documents directory not found: {root}")
+        notify: ProgressCallback = progress or (lambda *_: None)
         config = ChunkingConfig(
             chunk_size_tokens=self.settings.chunk_size_tokens,
             chunk_overlap_tokens=self.settings.chunk_overlap_tokens,
             csv_overlap_rows=self.settings.csv_overlap_rows,
         )
-        store = self._ready_store()
-        max_seq = getattr(self.embedder, "max_seq_length", None)
-        if max_seq and config.chunk_size_tokens > max_seq:
-            logger.warning(
-                "chunk size (%d est. tokens) exceeds the embedding model's limit (%d); chunk tails will be "
-                "truncated during embedding. Lower RAG_CHUNK_SIZE_TOKENS.",
-                config.chunk_size_tokens,
-                max_seq,
-            )
+        timers = {"hash": 0.0, "load": 0.0, "chunk": 0.0, "embed": 0.0, "db": 0.0}
+        store = self._store_for_ingest()
+        manifest = self._open_manifest(force)
+        report.manifest_note = manifest.note
 
+        t0 = time.perf_counter()
+        index = store.source_index()  # ONE query instead of one per file
+        timers["db"] += time.perf_counter() - t0
+        stored_chunks = sum(len(ids) for ids in index.values())
+        report.mode = "full re-index (--force)" if force else ("initial indexing" if stored_chunks == 0 else "incremental")
+
+        # ---- discovery + change detection (no parsing yet)
         load_stats = LoadStats()
-        for document in iter_documents(root, load_stats, project_folder_level=self.settings.project_folder_level):
-            path = document.source_path
+        jobs: List[Tuple[Path, str]] = []
+        allowed = {Path(p).as_posix().lstrip("/") for p in only_paths} if only_paths is not None else None
+        if allowed is not None:
+            prune = False  # a restricted run must never delete anything it was not asked about
+            report.mode = f"{report.mode} (selected files only)"
+        for path in _iter_files(root, True):
+            relative = path.relative_to(root).as_posix()
+            if allowed is not None and relative not in allowed:
+                continue
+            load_stats.files_found += 1
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                load_stats.unsupported_files.append(relative)
+                logger.warning("Skipping unsupported file type: %s", relative)
+                continue
+            load_stats.discovered_paths.append(relative)
+            jobs.append((path, relative))
+        report.files_discovered = len(jobs)
+
+        to_parse: List[Tuple[Path, str, str]] = []  # (path, relative path, sha256)
+        for path, relative in jobs:
+            t0 = time.perf_counter()
             try:
-                chunks = chunk_document(document, config)
-                if not chunks:
-                    load_stats.empty_files.append(path)
-                    logger.warning("No chunks produced for %s", path)
+                oversized = path.stat().st_size / (1024 * 1024) > DEFAULT_MAX_FILE_MB
+                sha = "" if oversized else _file_sha256(path)  # oversized files are rejected by the loader
+            except OSError as exc:
+                load_stats.failures.append((relative, f"cannot read file: {exc}"))
+                continue
+            finally:
+                timers["hash"] += time.perf_counter() - t0
+            entry = manifest.get(relative)
+            if entry is not None and sha and entry.sha256 == sha:
+                if entry.status == STATUS_EMPTY:
+                    load_stats.empty_files.append(relative)
+                    report.documents_empty_cached += 1
                     continue
-                report.chunks_generated += len(chunks)
-                new_ids = {c.id for c in chunks}
-                existing = store.source_chunk_ids(path)
-                if not force and existing == new_ids:
+                if entry.status == STATUS_OK and len(index.get(relative, ())) == entry.chunks:
                     report.documents_unchanged += 1
+                    report.documents_skipped_without_parsing += 1
+                    load_stats.documents_loaded += 1
                     continue
-                to_embed = chunks if force else [c for c in chunks if c.id not in existing]
-                vectors = self.embedder.embed_documents([c.text for c in to_embed])
-                report.chunks_embedded += len(to_embed)
-                report.records_upserted += store.upsert_chunks(to_embed, vectors)
-                report.stale_chunks_deleted += store.delete_source(path, keep_ids=new_ids)
+            to_parse.append((path, relative, sha))
+        logger.info(
+            "Ingestion plan (%s): %d supported files, %d unchanged (not parsed), %d to process. Manifest: %s",
+            report.mode, len(jobs), report.documents_unchanged + report.documents_empty_cached, len(to_parse),
+            manifest.note or "in use",
+        )
+        notify("plan", len(to_parse), len(jobs), report.mode)
+
+        # ---- parse -> embed -> store
+        pending: List[_Pending] = []
+        pending_chunks = 0
+        embedder_checked = False
+
+        def use_embedder() -> Embedder:
+            """Load the model on first need, then verify it matches the collection."""
+            nonlocal embedder_checked
+            embedder = self.embedder
+            self._ready_store()
+            if not embedder_checked:
+                embedder_checked = True
+                max_seq = getattr(embedder, "max_seq_length", None)
+                if max_seq and config.chunk_size_tokens > max_seq:
+                    logger.warning(
+                        "chunk size (%d est. tokens) exceeds the embedding model's limit (%d); chunk tails will be "
+                        "truncated during embedding. Lower RAG_CHUNK_SIZE_TOKENS.",
+                        config.chunk_size_tokens,
+                        max_seq,
+                    )
+            return embedder
+
+        def commit(ready: List[Tuple[_Pending, List[List[float]]]]) -> None:
+            if not ready:
+                return
+            t_db = time.perf_counter()
+            chunks = [c for item, _ in ready for c in item.to_embed]
+            vectors = [v for _, vecs in ready for v in vecs]
+            written: List[Tuple[_Pending, List[List[float]]]] = []
+            try:  # one upsert for many documents = far fewer SQLite transactions / HNSW writes
+                if chunks:
+                    report.records_upserted += store.upsert_chunks(chunks, vectors)
+                written = list(ready)
+            except VectorStoreError as exc:
+                logger.warning("Batched write failed (%s); retrying document by document", exc)
+                for item, vecs in ready:
+                    try:
+                        if item.to_embed:
+                            report.records_upserted += store.upsert_chunks(item.to_embed, vecs)
+                        written.append((item, vecs))
+                    except VectorStoreError as exc2:
+                        report.failures.append((item.path, str(exc2)))
+                        logger.error("Indexing failed for %s: %s", item.path, exc2)
+            for item, _ in written:
+                try:
+                    if item.stale_ids:
+                        store.delete_ids(item.stale_ids)  # ids already known: no lookup query
+                except VectorStoreError as exc:
+                    report.failures.append((item.path, str(exc)))
+                    logger.error("Could not delete stale chunks of %s: %s", item.path, exc)
+                    continue
+                report.chunks_embedded += len(item.to_embed)
+                report.stale_chunks_deleted += len(item.stale_ids)
                 report.documents_indexed += 1
-            except (EmbeddingError, VectorStoreError) as exc:
-                report.failures.append((path, str(exc)))
-                logger.error("Indexing failed for %s: %s", path, exc)
-            except Exception as exc:  # one bad document must not stop the run
-                report.failures.append((path, f"unexpected error: {exc}"))
-                logger.exception("Unexpected error while indexing %s", path)
+                index[item.path] = set(item.new_ids)
+                manifest.record(item.path, ManifestEntry(item.sha, STATUS_OK, item.total_chunks))
+            timers["db"] += time.perf_counter() - t_db
+            if self.settings.use_manifest:
+                manifest.save()  # checkpoint: an interrupted run resumes from here
+
+        def flush() -> None:
+            nonlocal pending, pending_chunks
+            if not pending:
+                return
+            batch, pending, pending_chunks = pending, [], 0
+            texts = [c.text for item in batch for c in item.to_embed]
+            ready: List[Tuple[_Pending, List[List[float]]]] = []
+            t_embed = time.perf_counter()
+            if not texts:  # only stale chunks to delete: no model needed
+                ready = [(item, []) for item in batch]
+            else:
+                embedder = use_embedder()
+                try:
+                    report.embed_calls += 1
+                    all_vectors = embedder.embed_documents(texts)  # one call for many documents
+                    offset = 0
+                    for item in batch:
+                        ready.append((item, all_vectors[offset : offset + len(item.to_embed)]))
+                        offset += len(item.to_embed)
+                except EmbeddingError:
+                    # Isolate the bad document: retry one by one so healthy files are still indexed.
+                    logger.warning("Batch embedding failed; retrying document by document")
+                    ready = []
+                    for item in batch:
+                        if not item.to_embed:
+                            ready.append((item, []))
+                            continue
+                        try:
+                            report.embed_calls += 1
+                            ready.append((item, embedder.embed_documents([c.text for c in item.to_embed])))
+                        except EmbeddingError as exc:
+                            report.failures.append((item.path, str(exc)))
+                            logger.error("Indexing failed for %s: %s", item.path, exc)
+            timers["embed"] += time.perf_counter() - t_embed
+            commit(ready)
+            logger.info("Progress: %d chunks embedded so far", report.chunks_embedded)
+            notify("embed", report.chunks_embedded, 0, "")
+
+        flush_at = self.settings.embed_flush_chunks
+        for number, (relative, sha, prepared) in enumerate(self._iter_prepared(to_parse, root, config), start=1):
+            notify("file", number, len(to_parse), relative)
+            timers["load"] += prepared.load_s
+            timers["chunk"] += prepared.chunk_s
+            load_stats.pages_failed += prepared.pages_failed
+            if prepared.status == "failed":
+                load_stats.failures.append((relative, prepared.error))
+                logger.warning("Failed to load %s: %s", relative, prepared.error)
+                continue
+            if prepared.status == "empty":
+                load_stats.empty_files.append(relative)
+                logger.warning("Empty document %s: %s", relative, prepared.error)
+                if sha:
+                    manifest.record(relative, ManifestEntry(sha, STATUS_EMPTY, 0))
+                continue
+            load_stats.documents_loaded += 1
+            load_stats.sections_loaded += prepared.sections
+            chunks = prepared.chunks
+            report.chunks_generated += len(chunks)
+            new_ids = {c.id for c in chunks}
+            existing = index.get(relative, set())
+            if not force and existing == new_ids:  # parsed, but identical to what is stored
+                report.documents_unchanged += 1
+                manifest.record(relative, ManifestEntry(sha, STATUS_OK, len(chunks)))
+                continue
+            to_embed = chunks if force else [c for c in chunks if c.id not in existing]
+            pending.append(_Pending(relative, sha, to_embed, new_ids, sorted(existing - new_ids), len(chunks)))
+            pending_chunks += len(to_embed)
+            if pending_chunks >= flush_at:
+                flush()
+        flush()
+        logger.info(
+            "Timing: hashing %.1fs | loading %.1fs | chunking %.1fs | embedding %.1fs | database %.1fs",
+            timers["hash"], timers["load"], timers["chunk"], timers["embed"], timers["db"],
+        )
 
         if prune:
             on_disk = set(load_stats.discovered_paths)
-            for indexed_path in list(store.list_sources()):
+            for indexed_path in list(index):
                 if indexed_path not in on_disk:
-                    report.pruned_chunks += store.delete_source(indexed_path)
+                    report.pruned_chunks += store.delete_ids(index.pop(indexed_path))
                     logger.info("Pruned %s (file no longer on disk)", indexed_path)
+            for known_path in list(manifest.entries):
+                if known_path not in on_disk:
+                    manifest.remove(known_path)
+        if self.settings.use_manifest:
+            manifest.save()
 
         report.documents_loaded = load_stats.documents_loaded
         report.failures = [(p, m) for p, m in load_stats.failures] + report.failures
         report.unsupported_files = list(load_stats.unsupported_files)
         report.empty_files = list(load_stats.empty_files)
         report.load_stats = load_stats.summary()
+        t0 = time.perf_counter()
         report.total_chunks_in_store = store.count()
+        timers["db"] += time.perf_counter() - t0
+        stats = getattr(self._embedder, "stats", None)
+        report.model_batches = int(getattr(stats, "batches", 0))
+        report.timings_s = {name: round(value, 3) for name, value in timers.items()}
         report.duration_s = round(time.perf_counter() - started, 2)
         logger.info("Ingestion finished: %s", {k: v for k, v in report.to_dict().items() if isinstance(v, (int, float))})
         return report

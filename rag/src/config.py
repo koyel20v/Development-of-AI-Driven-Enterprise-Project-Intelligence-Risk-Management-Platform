@@ -47,6 +47,18 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"Environment variable {name} must be true/false, got {raw!r}")
+
+
 def _env_float(name: str, default: float) -> float:
     value = _env_float_optional(name)
     return default if value is None else value
@@ -91,6 +103,11 @@ class RAGSettings:
     anthropic_model: str
     llm_max_tokens: int
     llm_timeout_s: float
+    # --- ingestion performance (all optional; defaults keep the old behaviour of the stored vectors) ---
+    load_workers: int = 1  # processes used to parse + chunk changed files; 1 = in-process (no multiprocessing)
+    use_manifest: bool = True  # skip parsing files whose content hash is unchanged since the last run
+    embed_flush_chunks: int = 256  # chunks (across documents) collected before one embedding + DB write
+    embedding_cache: bool = True  # Streamlit app: reuse stored vectors for identical text (SQLite file in chroma_dir)
 
     @classmethod
     def from_env(cls) -> "RAGSettings":
@@ -115,6 +132,10 @@ class RAGSettings:
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
             llm_max_tokens=_env_int("LLM_MAX_TOKENS", _env_int("ANTHROPIC_MAX_TOKENS", 1500)),
             llm_timeout_s=_env_float("LLM_TIMEOUT_S", _env_float("ANTHROPIC_TIMEOUT_S", 60.0)),
+            load_workers=_env_int("RAG_LOAD_WORKERS", 1),
+            use_manifest=_env_bool("RAG_USE_MANIFEST", True),
+            embed_flush_chunks=_env_int("RAG_EMBED_FLUSH_CHUNKS", 256),
+            embedding_cache=_env_bool("RAG_EMBEDDING_CACHE", True),
         )
         settings.validate()
         return settings
@@ -153,3 +174,7 @@ class RAGSettings:
             raise ConfigError("LLM_MAX_TOKENS must be at least 100")
         if self.max_context_tokens < 200:
             raise ConfigError("RAG_MAX_CONTEXT_TOKENS must be at least 200")
+        if not 1 <= self.load_workers <= 32:
+            raise ConfigError("RAG_LOAD_WORKERS must be between 1 and 32")
+        if self.embed_flush_chunks < 1:
+            raise ConfigError("RAG_EMBED_FLUSH_CHUNKS must be >= 1")

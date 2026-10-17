@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Protocol, Sequence, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,16 @@ _MAX_ATTEMPTS = 3
 
 class EmbeddingError(RuntimeError):
     """Embedding generation failed or produced invalid output."""
+
+
+@dataclass
+class EmbeddingStats:
+    """Counters for performance reports (reset by creating a new embedder)."""
+
+    batches: int = 0  # successful ``model.encode`` calls
+    texts: int = 0  # texts embedded
+    seconds: float = 0.0  # wall time inside ``model.encode``
+    retries: int = 0  # failed attempts that were retried
 
 
 @runtime_checkable
@@ -84,6 +95,7 @@ class SentenceTransformerEmbedder:
             lowered = model_name.lower()
             query_prefix = BGE_QUERY_PREFIX if "bge" in lowered and "-en" in lowered else ""
         self.query_prefix = query_prefix
+        self.stats = EmbeddingStats()
 
         try:
             logger.info("Loading embedding model %s", model_name)
@@ -104,6 +116,7 @@ class SentenceTransformerEmbedder:
     def _encode(self, texts: Sequence[str]) -> List[List[float]]:
         last_error: Optional[Exception] = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            started = time.perf_counter()
             try:
                 array = self._model.encode(
                     list(texts),
@@ -112,11 +125,18 @@ class SentenceTransformerEmbedder:
                     show_progress_bar=False,
                     convert_to_numpy=True,
                 )
-                return [[float(x) for x in row] for row in array]
+                vectors = [[float(x) for x in row] for row in array]
             except Exception as exc:  # e.g. out-of-memory on a large batch
                 last_error = exc
                 logger.warning("Embedding attempt %d/%d failed: %s", attempt, _MAX_ATTEMPTS, exc)
-                time.sleep(min(2 ** (attempt - 1), 4))
+                if attempt < _MAX_ATTEMPTS:  # no pointless sleep after the final attempt
+                    self.stats.retries += 1
+                    time.sleep(min(2 ** (attempt - 1), 4))
+                continue
+            self.stats.batches += 1
+            self.stats.texts += len(vectors)
+            self.stats.seconds += time.perf_counter() - started
+            return vectors
         raise EmbeddingError(f"Embedding failed after {_MAX_ATTEMPTS} attempts: {last_error}") from last_error
 
     @staticmethod
@@ -131,10 +151,16 @@ class SentenceTransformerEmbedder:
         if not texts:
             return []
         self._check_texts(texts)
-        vectors: List[List[float]] = []
-        for start in range(0, len(texts), self.batch_size):
-            vectors.extend(self._encode(texts[start : start + self.batch_size]))
-        validate_embeddings(vectors, len(texts), self.dimension)
+        # Batch similar-length texts together: padding to the longest text in a batch is
+        # wasted work on CPU. The original order is restored before returning.
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        sorted_vectors: List[List[float]] = []
+        for start in range(0, len(order), self.batch_size):
+            sorted_vectors.extend(self._encode([texts[i] for i in order[start : start + self.batch_size]]))
+        validate_embeddings(sorted_vectors, len(texts), self.dimension)
+        vectors: List[List[float]] = [[] for _ in texts]
+        for position, original_index in enumerate(order):
+            vectors[original_index] = sorted_vectors[position]
         return vectors
 
     def embed_query(self, text: str) -> List[float]:

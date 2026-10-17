@@ -248,13 +248,12 @@ def _pack_rows(items: List[_RowItem], budget: int, overlap_rows: int) -> List[Li
 
 def _chunk_csv(doc: LoadedDocument, config: ChunkingConfig) -> List[Tuple[str, Dict[str, Any]]]:
     """Return ``(text, extra_metadata)`` pairs for a CSV document."""
-    by_project: List[Tuple[str, List[DocumentSection]]] = []
+    # Group by project across the WHOLE file (not only consecutive runs): an unsorted
+    # register (A, B, A, B ...) would otherwise produce one tiny chunk per row.
+    grouped: Dict[str, List[DocumentSection]] = {}
     for section in doc.sections:
-        project = section.project_id or doc.project_id
-        if by_project and by_project[-1][0] == project:
-            by_project[-1][1].append(section)
-        else:
-            by_project.append((project, [section]))
+        grouped.setdefault(section.project_id or doc.project_id, []).append(section)
+    by_project = list(grouped.items())
 
     results: List[Tuple[str, Dict[str, Any]]] = []
     for project, sections in by_project:

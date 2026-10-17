@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import chromadb
 
@@ -30,6 +30,7 @@ from .text_chunker import Chunk
 logger = logging.getLogger(__name__)
 
 _MAX_BATCH = 500
+_SCAN_PAGE = 5000  # rows per page when scanning metadata
 
 
 class VectorStoreError(RuntimeError):
@@ -114,6 +115,22 @@ class ChromaVectorStore:
             raise VectorStoreError(f"Could not open ChromaDB at {self.persist_dir}: {exc}") from exc
 
     # ------------------------------------------------------------------ setup
+    @staticmethod
+    def peek_metadata(persist_dir: Path | str, collection_name: str) -> Optional[Dict[str, Any]]:
+        """Return an existing collection's metadata, or ``None`` if the directory/collection does not exist.
+
+        Read-only: never creates a directory or collection. Used so ingestion can learn the stored
+        embedding model/dimension without loading the (slow) embedding model first.
+        """
+        path = Path(persist_dir)
+        if not path.is_dir():
+            return None
+        try:
+            client = chromadb.PersistentClient(path=str(path))
+            return dict(client.get_collection(name=collection_name, embedding_function=None).metadata or {})
+        except Exception:
+            return None
+
     def _open_collection(self):
         metadata: Dict[str, Any] = {}
         if self.embedding_model:
@@ -198,6 +215,16 @@ class ChromaVectorStore:
             raise VectorStoreError(f"ChromaDB delete failed for {source_path}: {exc}") from exc
         return len(stale)
 
+    def delete_ids(self, ids: Iterable[str]) -> int:
+        """Delete chunks by id (no lookup query needed when the caller already knows the ids)."""
+        id_list = list(dict.fromkeys(ids))
+        try:
+            for start in range(0, len(id_list), _MAX_BATCH):
+                self._collection.delete(ids=id_list[start : start + _MAX_BATCH])
+        except Exception as exc:
+            raise VectorStoreError(f"ChromaDB delete failed: {exc}") from exc
+        return len(id_list)
+
     def reset(self) -> None:
         """Drop and recreate the *collection* only. The persistence directory is left in place."""
         try:
@@ -221,24 +248,46 @@ class ChromaVectorStore:
         except Exception as exc:
             raise VectorStoreError(f"ChromaDB lookup failed for {source_path}: {exc}") from exc
 
-    def list_sources(self) -> Dict[str, int]:
-        """Map ``source_path -> chunk count`` for everything indexed."""
+    def _scan_metadatas(self) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        """Yield ``(chunk_id, metadata)`` for every chunk, one page at a time (bounded memory)."""
+        offset = 0
+        while True:
+            page = self._collection.get(include=["metadatas"], limit=_SCAN_PAGE, offset=offset)
+            ids = page.get("ids") or []
+            if not ids:
+                return
+            metadatas = page.get("metadatas") or [None] * len(ids)
+            for chunk_id, meta in zip(ids, metadatas):
+                yield chunk_id, dict(meta or {})
+            if len(ids) < _SCAN_PAGE:
+                return
+            offset += _SCAN_PAGE
+
+    def source_index(self) -> Dict[str, Set[str]]:
+        """Map ``source_path -> set of chunk ids`` for the whole collection in ONE pass.
+
+        Replaces one ``get(where=...)`` query per file during ingestion.
+        """
+        index: Dict[str, Set[str]] = {}
         try:
-            records = self._collection.get(include=["metadatas"])
+            for chunk_id, meta in self._scan_metadatas():
+                index.setdefault(str(meta.get("source_path", "(unknown)")), set()).add(chunk_id)
         except Exception as exc:
             raise VectorStoreError(f"ChromaDB read failed: {exc}") from exc
-        counts: Dict[str, int] = {}
-        for meta in records.get("metadatas") or []:
-            path = (meta or {}).get("source_path", "(unknown)")
-            counts[path] = counts.get(path, 0) + 1
-        return dict(sorted(counts.items()))
+        return index
+
+    def list_sources(self) -> Dict[str, int]:
+        """Map ``source_path -> chunk count`` for everything indexed."""
+        return dict(sorted((path, len(ids)) for path, ids in self.source_index().items()))
 
     def stats(self) -> Dict[str, Any]:
-        sources = self.list_sources()
+        sources: Dict[str, int] = {}
         projects: Dict[str, int] = {}
         try:
-            for meta in self._collection.get(include=["metadatas"]).get("metadatas") or []:
-                project = (meta or {}).get("project_id", "(none)")
+            for _, meta in self._scan_metadatas():  # single scan (was two full reads)
+                path = meta.get("source_path", "(unknown)")
+                project = meta.get("project_id", "(none)")
+                sources[path] = sources.get(path, 0) + 1
                 projects[project] = projects.get(project, 0) + 1
         except Exception as exc:
             raise VectorStoreError(f"ChromaDB read failed: {exc}") from exc
@@ -250,7 +299,7 @@ class ChromaVectorStore:
             "total_chunks": sum(sources.values()),
             "total_sources": len(sources),
             "chunks_per_project": dict(sorted(projects.items())),
-            "chunks_per_source": sources,
+            "chunks_per_source": dict(sorted(sources.items())),
         }
 
     def query(
